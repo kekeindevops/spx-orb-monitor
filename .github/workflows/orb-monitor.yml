@@ -14,6 +14,7 @@ jobs:
       - name: Run SPX ORB Monitor
         run: |
           #!/bin/bash
+          set +e
 
           NTFY_TOPIC="https://ntfy.sh/spx-orb-alerts-balg-2026"
 
@@ -32,55 +33,85 @@ jobs:
           }
 
           get_spx() {
-            curl -s -L -A "Mozilla/5.0" \
+            local result
+            result=$(curl -s -L -A "Mozilla/5.0" \
               "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC?interval=1m&range=1d" | \
               python3 -c "
-          import sys, json
-          data = json.load(sys.stdin)
-          meta = data['chart']['result'][0]['meta']
-          print(meta['regularMarketPrice'])
-          "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    meta = data['chart']['result'][0]['meta']
+    print(meta['regularMarketPrice'])
+except Exception as e:
+    print('0')
+" 2>/dev/null)
+            echo "${result:-0}"
           }
 
           get_spx_prev_close() {
-            curl -s -L -A "Mozilla/5.0" \
+            local result
+            result=$(curl -s -L -A "Mozilla/5.0" \
               "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC?interval=1m&range=1d" | \
               python3 -c "
-          import sys, json
-          data = json.load(sys.stdin)
-          meta = data['chart']['result'][0]['meta']
-          print(meta['previousClose'])
-          "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    meta = data['chart']['result'][0]['meta']
+    print(meta['previousClose'])
+except Exception as e:
+    print('0')
+" 2>/dev/null)
+            echo "${result:-0}"
           }
 
           get_spx_5min_last_candle() {
-            curl -s -L -A "Mozilla/5.0" \
+            local result
+            result=$(curl -s -L -A "Mozilla/5.0" \
               "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC?interval=5m&range=1d" | \
               python3 -c "
-          import sys, json
-          data = json.load(sys.stdin)
-          closes = data['chart']['result'][0]['indicators']['quote'][0]['close']
-          closes = [c for c in closes if c is not None]
-          print(closes[-2] if len(closes) >= 2 else closes[-1])
-          "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    closes = data['chart']['result'][0]['indicators']['quote'][0]['close']
+    closes = [c for c in closes if c is not None]
+    print(closes[-2] if len(closes) >= 2 else closes[-1])
+except Exception as e:
+    print('0')
+" 2>/dev/null)
+            echo "${result:-0}"
+          }
+
+          get_stock_price() {
+            local symbol="$1"
+            local result
+            result=$(curl -s -L -A "Mozilla/5.0" \
+              "https://query1.finance.yahoo.com/v8/finance/chart/$symbol?interval=1m&range=1d" | \
+              python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    meta = data['chart']['result'][0]['meta']
+    price = meta.get('regularMarketPrice', 0)
+    prev = meta.get('previousClose', price)
+    chg = ((price - prev) / prev * 100) if prev else 0
+    print(f'\${price:.2f} ({chg:+.2f}%)')
+except Exception as e:
+    print('N/A')
+" 2>/dev/null)
+            echo "${result:-N/A}"
           }
 
           get_watchlist() {
-            curl -s -L -A "Mozilla/5.0" \
-              "https://query1.finance.yahoo.com/v7/finance/quote?symbols=SNDK,LITE,GEV,MSTR,NVDA,USAR" | \
-              python3 -c "
-          import sys, json
-          data = json.load(sys.stdin)
-          lines = []
-          for q in data['quoteResponse']['result']:
-              sym = q.get('symbol','')
-              price = q.get('regularMarketPrice', 0)
-              chg = q.get('regularMarketChangePercent', 0)
-              lines.append(f'{sym}: \${price:.2f} ({chg:+.2f}%)')
-          print(' | '.join(lines))
-          "
+            local nvda=$(get_stock_price "NVDA")
+            local sndk=$(get_stock_price "SNDK")
+            local lite=$(get_stock_price "LITE")
+            local gev=$(get_stock_price "GEV")
+            local mstr=$(get_stock_price "MSTR")
+            local usar=$(get_stock_price "USAR")
+            echo "NVDA: $nvda | SNDK: $sndk | LITE: $lite | GEV: $gev | MSTR: $mstr | USAR: $usar"
           }
 
+          # ── PHASE 1: PRE-MARKET 9:25 AM ──────────────────────────
           echo "=== PHASE 1: PRE-MARKET ==="
           SPX=$(get_spx)
           PREV=$(get_spx_prev_close)
@@ -93,8 +124,9 @@ jobs:
           WATCHLIST=$(get_watchlist)
 
           send_alert "SPX Pre-Market Bias" "default" "chart_with_upwards_trend" \
-            "SPX: $SPX | SPY: \$$SPY | Bias: $BIAS | Prev Close: $PREV | ORB levels at 9:45 AM | Before 11AM=0DTE After 11AM=1DTE | Watchlist: $WATCHLIST"
+            "SPX: $SPX | SPY: \$$SPY | Bias: $BIAS | Prev Close: $PREV | ORB levels at 9:45 AM | Before 11AM=0DTE After 11AM=1DTE | $WATCHLIST"
 
+          # ── PHASE 2: ORB BUILDING 9:30–9:45 AM ──────────────────
           echo "=== PHASE 2: SLEEPING 5 MIN FOR MARKET OPEN ==="
           sleep 300
 
@@ -107,12 +139,15 @@ jobs:
 
           while [ $(date +%s) -lt $END_ORB ]; do
             PRICE=$(get_spx)
-            if (( $(echo "$PRICE > $ORB_HIGH" | bc -l) )); then ORB_HIGH=$PRICE; fi
-            if (( $(echo "$PRICE < $ORB_LOW" | bc -l) )); then ORB_LOW=$PRICE; fi
+            if [ "$PRICE" != "0" ]; then
+              if (( $(echo "$PRICE > $ORB_HIGH" | bc -l) )); then ORB_HIGH=$PRICE; fi
+              if (( $(echo "$PRICE < $ORB_LOW" | bc -l) )); then ORB_LOW=$PRICE; fi
+            fi
             echo "SPX: $PRICE | High: $ORB_HIGH | Low: $ORB_LOW"
             sleep 60
           done
 
+          # ── PHASE 3: ORB ANNOUNCEMENT 9:45 AM ────────────────────
           echo "=== PHASE 3: ORB ANNOUNCEMENT ==="
           ORB_RANGE=$(echo "scale=2; $ORB_HIGH - $ORB_LOW" | bc)
 
@@ -129,6 +164,7 @@ jobs:
           send_alert "ORB SET - $DAY_TYPE DAY" "high" "chart_with_upwards_trend" \
             "ORB High: $ORB_HIGH | ORB Low: $ORB_LOW | Range: $ORB_RANGE pts | $DAY_TYPE | BULL entry: 5-min candle CLOSES above $ORB_HIGH | BEAR entry: 5-min candle CLOSES below $ORB_LOW | T1: +\$$T1_OFFSET sell 25 | T2: +\$$T2_OFFSET sell 25 | SPY 0.10 delta 50 contracts"
 
+          # ── PHASE 4: MONITORING 9:45 AM – 2:00 PM ────────────────
           echo "=== PHASE 4: MONITORING ==="
           IN_TRADE=false
           DIRECTION=""
@@ -151,7 +187,7 @@ jobs:
             LAST_CANDLE=$(get_spx_5min_last_candle)
             echo "SPX: $PRICE | SPY: $SPY_PRICE | Candle: $LAST_CANDLE | Trade: $IN_TRADE $DIRECTION"
 
-            if [ "$IN_TRADE" = false ]; then
+            if [ "$IN_TRADE" = false ] && [ "$PRICE" != "0" ]; then
               DIST_HIGH=$(echo "scale=2; $ORB_HIGH - $PRICE" | bc)
               DIST_LOW=$(echo "scale=2; $PRICE - $ORB_LOW" | bc)
               if (( $(echo "$DIST_HIGH >= 0 && $DIST_HIGH <= 2" | bc -l) )); then
@@ -164,7 +200,7 @@ jobs:
               fi
             fi
 
-            if [ "$IN_TRADE" = false ] && (( $(echo "$LAST_CANDLE > $ORB_HIGH" | bc -l) )); then
+            if [ "$IN_TRADE" = false ] && [ "$LAST_CANDLE" != "0" ] && (( $(echo "$LAST_CANDLE > $ORB_HIGH" | bc -l) )); then
               IN_TRADE=true
               DIRECTION="CALL"
               SPY_ENTRY=$SPY_PRICE
@@ -174,7 +210,7 @@ jobs:
                 "BUY SPY CALL $EXPIRY 0.10 DELTA 50 CONTRACTS NOW! SPX candle closed $LAST_CANDLE above ORB High $ORB_HIGH | SPY entry: \$$SPY_ENTRY | T1: \$$T1 sell 25 | T2: \$$T2 sell 25 | NO AUTO STOP ON ROBINHOOD - EXIT MANUALLY!"
             fi
 
-            if [ "$IN_TRADE" = false ] && (( $(echo "$LAST_CANDLE < $ORB_LOW" | bc -l) )); then
+            if [ "$IN_TRADE" = false ] && [ "$LAST_CANDLE" != "0" ] && (( $(echo "$LAST_CANDLE < $ORB_LOW" | bc -l) )); then
               IN_TRADE=true
               DIRECTION="PUT"
               SPY_ENTRY=$SPY_PRICE
@@ -184,13 +220,13 @@ jobs:
                 "BUY SPY PUT $EXPIRY 0.10 DELTA 50 CONTRACTS NOW! SPX candle closed $LAST_CANDLE below ORB Low $ORB_LOW | SPY entry: \$$SPY_ENTRY | T1: \$$T1 sell 25 | T2: \$$T2 sell 25 | NO AUTO STOP ON ROBINHOOD - EXIT MANUALLY!"
             fi
 
-            if [ "$IN_TRADE" = true ] && [ "$DIRECTION" = "CALL" ] && (( $(echo "$LAST_CANDLE < $ORB_HIGH" | bc -l) )); then
+            if [ "$IN_TRADE" = true ] && [ "$DIRECTION" = "CALL" ] && [ "$LAST_CANDLE" != "0" ] && (( $(echo "$LAST_CANDLE < $ORB_HIGH" | bc -l) )); then
               IN_TRADE=false; T1_HIT=false; T2_HIT=false
               send_alert "STOP HIT - EXIT CALL NOW" "urgent" "stop_sign" \
                 "SPX candle closed back inside ORB! SELL ALL 50 SPY CALLS NOW on Robinhood! SPX at $PRICE"
             fi
 
-            if [ "$IN_TRADE" = true ] && [ "$DIRECTION" = "PUT" ] && (( $(echo "$LAST_CANDLE > $ORB_LOW" | bc -l) )); then
+            if [ "$IN_TRADE" = true ] && [ "$DIRECTION" = "PUT" ] && [ "$LAST_CANDLE" != "0" ] && (( $(echo "$LAST_CANDLE > $ORB_LOW" | bc -l) )); then
               IN_TRADE=false; T1_HIT=false; T2_HIT=false
               send_alert "STOP HIT - EXIT PUT NOW" "urgent" "stop_sign" \
                 "SPX candle closed back inside ORB! SELL ALL 50 SPY PUTS NOW on Robinhood! SPX at $PRICE"
