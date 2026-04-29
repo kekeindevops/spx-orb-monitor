@@ -13,258 +13,269 @@ jobs:
     steps:
       - name: Run SPX ORB Monitor
         run: |
-          #!/bin/bash
-          set +e
+          python3 << 'PYEOF'
+          import urllib.request
+          import json
+          import time
+          import subprocess
+          from datetime import datetime, timezone, timedelta
 
-          NTFY_TOPIC="https://ntfy.sh/spx-orb-alerts-balg-2026"
+          NTFY_TOPIC = "https://ntfy.sh/spx-orb-alerts-balg-2026"
+          EST = timezone(timedelta(hours=-4))  # EDT (UTC-4)
 
-          send_alert() {
-            local title="$1"
-            local priority="$2"
-            local tags="$3"
-            local message="$4"
-            curl -s -X POST "$NTFY_TOPIC" \
-              -H "Title: $title" \
-              -H "Priority: $priority" \
-              -H "Tags: $tags" \
-              -H "Content-Type: text/plain" \
-              --data-raw "$message"
-            echo "Alert sent: $title"
-          }
+          def send_alert(title, priority, tags, message):
+              try:
+                  req = urllib.request.Request(
+                      NTFY_TOPIC,
+                      data=message.encode("utf-8"),
+                      headers={
+                          "Title": title,
+                          "Priority": priority,
+                          "Tags": tags,
+                          "Content-Type": "text/plain"
+                      },
+                      method="POST"
+                  )
+                  urllib.request.urlopen(req, timeout=10)
+                  print(f"Alert sent: {title}")
+              except Exception as e:
+                  print(f"Alert error: {e}")
 
-          get_spx() {
-            local result
-            result=$(curl -s -L -A "Mozilla/5.0" \
-              "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC?interval=1m&range=1d" | \
-              python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    meta = data['chart']['result'][0]['meta']
-    print(meta['regularMarketPrice'])
-except Exception as e:
-    print('0')
-" 2>/dev/null)
-            echo "${result:-0}"
-          }
+          def get_spx():
+              try:
+                  url = "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC?interval=1m&range=1d"
+                  req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                  with urllib.request.urlopen(req, timeout=15) as r:
+                      data = json.loads(r.read())
+                  meta = data["chart"]["result"][0]["meta"]
+                  return float(meta["regularMarketPrice"]), float(meta["previousClose"])
+              except Exception as e:
+                  print(f"SPX fetch error: {e}")
+                  return 0.0, 0.0
 
-          get_spx_prev_close() {
-            local result
-            result=$(curl -s -L -A "Mozilla/5.0" \
-              "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC?interval=1m&range=1d" | \
-              python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    meta = data['chart']['result'][0]['meta']
-    print(meta['previousClose'])
-except Exception as e:
-    print('0')
-" 2>/dev/null)
-            echo "${result:-0}"
-          }
+          def get_spx_5min_candle():
+              try:
+                  url = "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC?interval=5m&range=1d"
+                  req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                  with urllib.request.urlopen(req, timeout=15) as r:
+                      data = json.loads(r.read())
+                  closes = data["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+                  closes = [c for c in closes if c is not None]
+                  return float(closes[-2]) if len(closes) >= 2 else float(closes[-1])
+              except Exception as e:
+                  print(f"5min candle error: {e}")
+                  return 0.0
 
-          get_spx_5min_last_candle() {
-            local result
-            result=$(curl -s -L -A "Mozilla/5.0" \
-              "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC?interval=5m&range=1d" | \
-              python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    closes = data['chart']['result'][0]['indicators']['quote'][0]['close']
-    closes = [c for c in closes if c is not None]
-    print(closes[-2] if len(closes) >= 2 else closes[-1])
-except Exception as e:
-    print('0')
-" 2>/dev/null)
-            echo "${result:-0}"
-          }
+          def get_stock(symbol):
+              try:
+                  url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1m&range=1d"
+                  req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                  with urllib.request.urlopen(req, timeout=15) as r:
+                      data = json.loads(r.read())
+                  meta = data["chart"]["result"][0]["meta"]
+                  price = float(meta.get("regularMarketPrice", 0))
+                  prev = float(meta.get("previousClose", price))
+                  chg = ((price - prev) / prev * 100) if prev else 0
+                  return f"${price:.2f} ({chg:+.1f}%)"
+              except Exception as e:
+                  return "N/A"
 
-          get_stock_price() {
-            local symbol="$1"
-            local result
-            result=$(curl -s -L -A "Mozilla/5.0" \
-              "https://query1.finance.yahoo.com/v8/finance/chart/$symbol?interval=1m&range=1d" | \
-              python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    meta = data['chart']['result'][0]['meta']
-    price = meta.get('regularMarketPrice', 0)
-    prev = meta.get('previousClose', price)
-    chg = ((price - prev) / prev * 100) if prev else 0
-    print(f'\${price:.2f} ({chg:+.2f}%)')
-except Exception as e:
-    print('N/A')
-" 2>/dev/null)
-            echo "${result:-N/A}"
-          }
+          def get_watchlist():
+              symbols = ["NVDA", "SNDK", "LITE", "GEV", "MSTR", "USAR"]
+              parts = []
+              for s in symbols:
+                  parts.append(f"{s}: {get_stock(s)}")
+              return " | ".join(parts)
 
-          get_watchlist() {
-            local nvda=$(get_stock_price "NVDA")
-            local sndk=$(get_stock_price "SNDK")
-            local lite=$(get_stock_price "LITE")
-            local gev=$(get_stock_price "GEV")
-            local mstr=$(get_stock_price "MSTR")
-            local usar=$(get_stock_price "USAR")
-            echo "NVDA: $nvda | SNDK: $sndk | LITE: $lite | GEV: $gev | MSTR: $mstr | USAR: $usar"
-          }
+          def now_est():
+              return datetime.now(EST)
+
+          def wait_until(target_hour, target_min):
+              now = now_est()
+              target = now.replace(hour=target_hour, minute=target_min, second=0, microsecond=0)
+              diff = (target - now).total_seconds()
+              if diff > 0:
+                  print(f"Waiting {diff:.0f}s until {target_hour}:{target_min:02d} EST...")
+                  time.sleep(diff)
 
           # ── PHASE 1: PRE-MARKET 9:25 AM ──────────────────────────
-          echo "=== PHASE 1: PRE-MARKET ==="
-          SPX=$(get_spx)
-          PREV=$(get_spx_prev_close)
-          SPY=$(echo "scale=2; $SPX / 10" | bc)
+          print("=== PHASE 1: PRE-MARKET ===")
+          spx, prev = get_spx()
+          spy = spx / 10
+          if spx > prev:
+              bias = "BULLISH"
+          elif spx < prev:
+              bias = "BEARISH"
+          else:
+              bias = "NEUTRAL"
 
-          if (( $(echo "$SPX > $PREV" | bc -l) )); then BIAS="BULLISH"
-          elif (( $(echo "$SPX < $PREV" | bc -l) )); then BIAS="BEARISH"
-          else BIAS="NEUTRAL"; fi
-
-          WATCHLIST=$(get_watchlist)
-
-          send_alert "SPX Pre-Market Bias" "default" "chart_with_upwards_trend" \
-            "SPX: $SPX | SPY: \$$SPY | Bias: $BIAS | Prev Close: $PREV | ORB levels at 9:45 AM | Before 11AM=0DTE After 11AM=1DTE | $WATCHLIST"
+          watchlist = get_watchlist()
+          send_alert(
+              "SPX Pre-Market Bias", "default", "chart_with_upwards_trend",
+              f"SPX: {spx:.2f} | SPY: ${spy:.2f} | Bias: {bias} | Prev Close: {prev:.2f}\n"
+              f"ORB levels announced at 9:45 AM | Before 11AM=0DTE After 11AM=1DTE\n"
+              f"{watchlist}"
+          )
 
           # ── PHASE 2: ORB BUILDING 9:30–9:45 AM ──────────────────
-          echo "=== PHASE 2: SLEEPING 5 MIN FOR MARKET OPEN ==="
-          sleep 300
+          print("=== PHASE 2: WAITING FOR MARKET OPEN ===")
+          wait_until(9, 30)
 
-          ORB_HIGH=0
-          ORB_LOW=999999
-          END_ORB=$(($(date +%s) + 900))
+          orb_high = 0.0
+          orb_low = 999999.0
+          end_orb = time.time() + 900  # 15 minutes
 
-          send_alert "ORB Building" "default" "eyes" \
-            "Market open! Tracking SPX high and low for 15 minutes. NO entries until 9:45 AM."
+          send_alert("ORB Building", "default", "eyes",
+              "Market open! Building 15-min ORB range. NO entries until 9:45 AM.")
 
-          while [ $(date +%s) -lt $END_ORB ]; do
-            PRICE=$(get_spx)
-            if [ "$PRICE" != "0" ]; then
-              if (( $(echo "$PRICE > $ORB_HIGH" | bc -l) )); then ORB_HIGH=$PRICE; fi
-              if (( $(echo "$PRICE < $ORB_LOW" | bc -l) )); then ORB_LOW=$PRICE; fi
-            fi
-            echo "SPX: $PRICE | High: $ORB_HIGH | Low: $ORB_LOW"
-            sleep 60
-          done
+          while time.time() < end_orb:
+              price, _ = get_spx()
+              if price > 0:
+                  if price > orb_high:
+                      orb_high = price
+                  if price < orb_low:
+                      orb_low = price
+              print(f"SPX: {price:.2f} | ORB High: {orb_high:.2f} | ORB Low: {orb_low:.2f}")
+              time.sleep(60)
 
           # ── PHASE 3: ORB ANNOUNCEMENT 9:45 AM ────────────────────
-          echo "=== PHASE 3: ORB ANNOUNCEMENT ==="
-          ORB_RANGE=$(echo "scale=2; $ORB_HIGH - $ORB_LOW" | bc)
+          print("=== PHASE 3: ORB ANNOUNCEMENT ===")
+          orb_range = orb_high - orb_low
+          if orb_range < 15:
+              day_type = "CHOPPY"
+              t1_offset = 1.00
+              t2_offset = 1.50
+          else:
+              day_type = "TRENDING"
+              t1_offset = 1.50
+              t2_offset = 2.00
 
-          if (( $(echo "$ORB_RANGE < 15" | bc -l) )); then
-            DAY_TYPE="CHOPPY"
-            T1_OFFSET="1.00"
-            T2_OFFSET="1.50"
-          else
-            DAY_TYPE="TRENDING"
-            T1_OFFSET="1.50"
-            T2_OFFSET="2.00"
-          fi
-
-          send_alert "ORB SET - $DAY_TYPE DAY" "high" "chart_with_upwards_trend" \
-            "ORB High: $ORB_HIGH | ORB Low: $ORB_LOW | Range: $ORB_RANGE pts | $DAY_TYPE | BULL entry: 5-min candle CLOSES above $ORB_HIGH | BEAR entry: 5-min candle CLOSES below $ORB_LOW | T1: +\$$T1_OFFSET sell 25 | T2: +\$$T2_OFFSET sell 25 | SPY 0.10 delta 50 contracts"
+          send_alert(
+              f"ORB SET - {day_type} DAY", "high", "chart_with_upwards_trend",
+              f"ORB High: {orb_high:.2f} | ORB Low: {orb_low:.2f} | Range: {orb_range:.2f} pts\n"
+              f"Day Type: {day_type}\n"
+              f"BULL entry: 5-min SPX candle CLOSES above {orb_high:.2f}\n"
+              f"BEAR entry: 5-min SPX candle CLOSES below {orb_low:.2f}\n"
+              f"T1: +${t1_offset:.2f} (sell 25 contracts) | T2: +${t2_offset:.2f} (sell 25 contracts)\n"
+              f"SPY options 0.10 delta 50 contracts total"
+          )
 
           # ── PHASE 4: MONITORING 9:45 AM – 2:00 PM ────────────────
-          echo "=== PHASE 4: MONITORING ==="
-          IN_TRADE=false
-          DIRECTION=""
-          SPY_ENTRY=0
-          T1=0
-          T2=0
-          T1_HIT=false
-          T2_HIT=false
-          LAST_HOURLY=$(date +%s)
-          END_SESSION=$(($(date +%s) + 15300))
+          print("=== PHASE 4: MONITORING ===")
+          in_trade = False
+          direction = ""
+          spy_entry = 0.0
+          t1 = 0.0
+          t2 = 0.0
+          t1_hit = False
+          t2_hit = False
+          last_hourly = time.time()
+          end_session = time.time() + 15300  # 4h 15min
 
-          while [ $(date +%s) -lt $END_SESSION ]; do
-            PRICE=$(get_spx)
-            SPY_PRICE=$(echo "scale=2; $PRICE / 10" | bc)
-            NOW=$(date +%s)
-            UTC_HOUR=$(date -u +%H)
-            EXPIRY="0DTE"
-            if [ "$UTC_HOUR" -ge 15 ]; then EXPIRY="1DTE"; fi
+          while time.time() < end_session:
+              price, _ = get_spx()
+              spy_price = price / 10
+              last_candle = get_spx_5min_candle()
+              est_now = now_est()
+              expiry = "0DTE" if est_now.hour < 11 else "1DTE"
 
-            LAST_CANDLE=$(get_spx_5min_last_candle)
-            echo "SPX: $PRICE | SPY: $SPY_PRICE | Candle: $LAST_CANDLE | Trade: $IN_TRADE $DIRECTION"
+              print(f"{est_now.strftime('%H:%M')} EST | SPX: {price:.2f} | SPY: ${spy_price:.2f} | Candle: {last_candle:.2f} | Trade: {in_trade} {direction}")
 
-            if [ "$IN_TRADE" = false ] && [ "$PRICE" != "0" ]; then
-              DIST_HIGH=$(echo "scale=2; $ORB_HIGH - $PRICE" | bc)
-              DIST_LOW=$(echo "scale=2; $PRICE - $ORB_LOW" | bc)
-              if (( $(echo "$DIST_HIGH >= 0 && $DIST_HIGH <= 2" | bc -l) )); then
-                send_alert "APPROACHING ORB HIGH" "high" "eyes" \
-                  "SPX at $PRICE - $DIST_HIGH pts below ORB High $ORB_HIGH! Get Robinhood ready for CALL!"
-              fi
-              if (( $(echo "$DIST_LOW >= 0 && $DIST_LOW <= 2" | bc -l) )); then
-                send_alert "APPROACHING ORB LOW" "high" "eyes" \
-                  "SPX at $PRICE - $DIST_LOW pts above ORB Low $ORB_LOW! Get Robinhood ready for PUT!"
-              fi
-            fi
+              # Approaching alert
+              if not in_trade and price > 0:
+                  dist_high = orb_high - price
+                  dist_low = price - orb_low
+                  if 0 <= dist_high <= 2:
+                      send_alert("APPROACHING ORB HIGH", "high", "eyes",
+                          f"SPX at {price:.2f} — only {dist_high:.1f} pts below ORB High {orb_high:.2f}! Get Robinhood ready for CALL!")
+                  if 0 <= dist_low <= 2:
+                      send_alert("APPROACHING ORB LOW", "high", "eyes",
+                          f"SPX at {price:.2f} — only {dist_low:.1f} pts above ORB Low {orb_low:.2f}! Get Robinhood ready for PUT!")
 
-            if [ "$IN_TRADE" = false ] && [ "$LAST_CANDLE" != "0" ] && (( $(echo "$LAST_CANDLE > $ORB_HIGH" | bc -l) )); then
-              IN_TRADE=true
-              DIRECTION="CALL"
-              SPY_ENTRY=$SPY_PRICE
-              T1=$(echo "scale=2; $SPY_ENTRY + $T1_OFFSET" | bc)
-              T2=$(echo "scale=2; $SPY_ENTRY + $T2_OFFSET" | bc)
-              send_alert "BULL ENTRY - BUY SPY CALL NOW" "urgent" "rotating_light" \
-                "BUY SPY CALL $EXPIRY 0.10 DELTA 50 CONTRACTS NOW! SPX candle closed $LAST_CANDLE above ORB High $ORB_HIGH | SPY entry: \$$SPY_ENTRY | T1: \$$T1 sell 25 | T2: \$$T2 sell 25 | NO AUTO STOP ON ROBINHOOD - EXIT MANUALLY!"
-            fi
+              # Bull entry
+              if not in_trade and last_candle > orb_high and last_candle > 0:
+                  in_trade = True
+                  direction = "CALL"
+                  spy_entry = spy_price
+                  t1 = round(spy_entry + t1_offset, 2)
+                  t2 = round(spy_entry + t2_offset, 2)
+                  send_alert("BULL ENTRY - BUY SPY CALL NOW", "urgent", "rotating_light",
+                      f"BUY SPY CALL {expiry} 0.10 DELTA — 50 CONTRACTS NOW!\n"
+                      f"SPX 5-min candle closed at {last_candle:.2f} above ORB High {orb_high:.2f}\n"
+                      f"SPY entry: ${spy_entry:.2f}\n"
+                      f"T1: ${t1:.2f} — sell 25 contracts\n"
+                      f"T2: ${t2:.2f} — sell 25 contracts\n"
+                      f"Stop: 5-min candle closes back inside ORB\n"
+                      f"NO AUTO STOP ON ROBINHOOD — EXIT MANUALLY!")
 
-            if [ "$IN_TRADE" = false ] && [ "$LAST_CANDLE" != "0" ] && (( $(echo "$LAST_CANDLE < $ORB_LOW" | bc -l) )); then
-              IN_TRADE=true
-              DIRECTION="PUT"
-              SPY_ENTRY=$SPY_PRICE
-              T1=$(echo "scale=2; $SPY_ENTRY - $T1_OFFSET" | bc)
-              T2=$(echo "scale=2; $SPY_ENTRY - $T2_OFFSET" | bc)
-              send_alert "BEAR ENTRY - BUY SPY PUT NOW" "urgent" "rotating_light" \
-                "BUY SPY PUT $EXPIRY 0.10 DELTA 50 CONTRACTS NOW! SPX candle closed $LAST_CANDLE below ORB Low $ORB_LOW | SPY entry: \$$SPY_ENTRY | T1: \$$T1 sell 25 | T2: \$$T2 sell 25 | NO AUTO STOP ON ROBINHOOD - EXIT MANUALLY!"
-            fi
+              # Bear entry
+              elif not in_trade and last_candle < orb_low and last_candle > 0:
+                  in_trade = True
+                  direction = "PUT"
+                  spy_entry = spy_price
+                  t1 = round(spy_entry - t1_offset, 2)
+                  t2 = round(spy_entry - t2_offset, 2)
+                  send_alert("BEAR ENTRY - BUY SPY PUT NOW", "urgent", "rotating_light",
+                      f"BUY SPY PUT {expiry} 0.10 DELTA — 50 CONTRACTS NOW!\n"
+                      f"SPX 5-min candle closed at {last_candle:.2f} below ORB Low {orb_low:.2f}\n"
+                      f"SPY entry: ${spy_entry:.2f}\n"
+                      f"T1: ${t1:.2f} — sell 25 contracts\n"
+                      f"T2: ${t2:.2f} — sell 25 contracts\n"
+                      f"Stop: 5-min candle closes back inside ORB\n"
+                      f"NO AUTO STOP ON ROBINHOOD — EXIT MANUALLY!")
 
-            if [ "$IN_TRADE" = true ] && [ "$DIRECTION" = "CALL" ] && [ "$LAST_CANDLE" != "0" ] && (( $(echo "$LAST_CANDLE < $ORB_HIGH" | bc -l) )); then
-              IN_TRADE=false; T1_HIT=false; T2_HIT=false
-              send_alert "STOP HIT - EXIT CALL NOW" "urgent" "stop_sign" \
-                "SPX candle closed back inside ORB! SELL ALL 50 SPY CALLS NOW on Robinhood! SPX at $PRICE"
-            fi
+              # Stop - Call
+              if in_trade and direction == "CALL" and last_candle < orb_high and last_candle > 0:
+                  in_trade = False
+                  t1_hit = False
+                  t2_hit = False
+                  send_alert("STOP HIT - EXIT CALL NOW", "urgent", "stop_sign",
+                      f"SPX 5-min candle closed back inside ORB at {last_candle:.2f}!\n"
+                      f"SELL ALL 50 SPY CALLS NOW on Robinhood! SPX at {price:.2f}")
 
-            if [ "$IN_TRADE" = true ] && [ "$DIRECTION" = "PUT" ] && [ "$LAST_CANDLE" != "0" ] && (( $(echo "$LAST_CANDLE > $ORB_LOW" | bc -l) )); then
-              IN_TRADE=false; T1_HIT=false; T2_HIT=false
-              send_alert "STOP HIT - EXIT PUT NOW" "urgent" "stop_sign" \
-                "SPX candle closed back inside ORB! SELL ALL 50 SPY PUTS NOW on Robinhood! SPX at $PRICE"
-            fi
+              # Stop - Put
+              if in_trade and direction == "PUT" and last_candle > orb_low and last_candle > 0:
+                  in_trade = False
+                  t1_hit = False
+                  t2_hit = False
+                  send_alert("STOP HIT - EXIT PUT NOW", "urgent", "stop_sign",
+                      f"SPX 5-min candle closed back inside ORB at {last_candle:.2f}!\n"
+                      f"SELL ALL 50 SPY PUTS NOW on Robinhood! SPX at {price:.2f}")
 
-            if [ "$IN_TRADE" = true ] && [ "$T1_HIT" = false ]; then
-              if ([ "$DIRECTION" = "CALL" ] && (( $(echo "$SPY_PRICE >= $T1" | bc -l) ))) || \
-                 ([ "$DIRECTION" = "PUT" ] && (( $(echo "$SPY_PRICE <= $T1" | bc -l) ))); then
-                T1_HIT=true
-                send_alert "TARGET 1 HIT - SELL 25 NOW" "urgent" "trophy" \
-                  "T1 at \$$T1 REACHED! SELL 25 CONTRACTS NOW on Robinhood! Hold 25 for T2 at \$$T2"
-              fi
-            fi
+              # Target 1
+              if in_trade and not t1_hit:
+                  if (direction == "CALL" and spy_price >= t1) or (direction == "PUT" and spy_price <= t1):
+                      t1_hit = True
+                      send_alert("TARGET 1 HIT - SELL 25 NOW", "urgent", "trophy",
+                          f"T1 at ${t1:.2f} REACHED! SELL 25 CONTRACTS NOW on Robinhood!\n"
+                          f"Hold remaining 25 contracts for T2 at ${t2:.2f}")
 
-            if [ "$IN_TRADE" = true ] && [ "$T1_HIT" = true ] && [ "$T2_HIT" = false ]; then
-              if ([ "$DIRECTION" = "CALL" ] && (( $(echo "$SPY_PRICE >= $T2" | bc -l) ))) || \
-                 ([ "$DIRECTION" = "PUT" ] && (( $(echo "$SPY_PRICE <= $T2" | bc -l) ))); then
-                T2_HIT=true; IN_TRADE=false
-                send_alert "TARGET 2 HIT - EXIT ALL" "urgent" "trophy" \
-                  "T2 at \$$T2 REACHED! SELL REMAINING 25 CONTRACTS NOW! Trade complete!"
-              fi
-            fi
+              # Target 2
+              if in_trade and t1_hit and not t2_hit:
+                  if (direction == "CALL" and spy_price >= t2) or (direction == "PUT" and spy_price <= t2):
+                      t2_hit = True
+                      in_trade = False
+                      send_alert("TARGET 2 HIT - EXIT ALL", "urgent", "trophy",
+                          f"T2 at ${t2:.2f} REACHED! SELL REMAINING 25 CONTRACTS NOW!\n"
+                          f"Trade complete! Great job!")
 
-            if [ $((NOW - LAST_HOURLY)) -ge 3600 ]; then
-              LAST_HOURLY=$NOW
-              WATCHLIST=$(get_watchlist)
-              if [ "$IN_TRADE" = true ]; then
-                STATUS="IN $DIRECTION | Entry: \$$SPY_ENTRY | T1: \$$T1 | T2: \$$T2"
-              else
-                STATUS="Watching ORB: $ORB_LOW - $ORB_HIGH"
-              fi
-              send_alert "SPX Hourly Update" "default" "chart_with_upwards_trend" \
-                "SPX: $PRICE | SPY: \$$SPY_PRICE | $STATUS | $WATCHLIST"
-            fi
+              # Hourly update
+              if time.time() - last_hourly >= 3600:
+                  last_hourly = time.time()
+                  watchlist = get_watchlist()
+                  if in_trade:
+                      status = f"IN {direction} | Entry: ${spy_entry:.2f} | T1: ${t1:.2f} | T2: ${t2:.2f}"
+                  else:
+                      status = f"Watching | ORB: {orb_low:.2f} - {orb_high:.2f}"
+                  send_alert("SPX Hourly Update", "default", "chart_with_upwards_trend",
+                      f"SPX: {price:.2f} | SPY: ${spy_price:.2f} | {status}\n{watchlist}")
 
-            sleep 60
-          done
+              time.sleep(60)
 
-          FINAL=$(get_spx)
-          send_alert "Session Closed" "default" "white_check_mark" \
-            "ORB monitoring done for today. SPX final: $FINAL. See you tomorrow at 9:25 AM!"
+          # ── SESSION CLOSE 2:00 PM ─────────────────────────────────
+          price, _ = get_spx()
+          send_alert("Session Closed", "default", "white_check_mark",
+              f"ORB monitoring done for today. SPX final: {price:.2f}. See you tomorrow at 9:25 AM!")
+
+          print("=== SESSION COMPLETE ===")
+          PYEOF
