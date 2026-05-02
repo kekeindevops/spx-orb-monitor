@@ -8,7 +8,7 @@ on:
 jobs:
   orb-monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 360
 
     steps:
       - name: Run SPX ORB Monitor
@@ -17,19 +17,21 @@ jobs:
           import urllib.request
           import json
           import time
-          import subprocess
           from datetime import datetime, timezone, timedelta
 
           NTFY_TOPIC = "https://ntfy.sh/spx-orb-alerts-balg-2026"
-          EST = timezone(timedelta(hours=-4))  # EDT (UTC-4)
+          EST = timezone(timedelta(hours=-4))
 
           def send_alert(title, priority, tags, message):
               try:
+                  # Strip all non-ASCII characters to prevent attachment issue
+                  safe_msg = message.encode("ascii", "ignore").decode("ascii")
+                  safe_title = title.encode("ascii", "ignore").decode("ascii")
                   req = urllib.request.Request(
                       NTFY_TOPIC,
-                      data=message.encode("utf-8"),
+                      data=safe_msg.encode("utf-8"),
                       headers={
-                          "Title": title,
+                          "Title": safe_title,
                           "Priority": priority,
                           "Tags": tags,
                           "Content-Type": "text/plain"
@@ -37,9 +39,9 @@ jobs:
                       method="POST"
                   )
                   urllib.request.urlopen(req, timeout=10)
-                  print(f"Alert sent: {title}")
+                  print(f"[ALERT SENT] {title}")
               except Exception as e:
-                  print(f"Alert error: {e}")
+                  print(f"[ALERT ERROR] {e}")
 
           def get_spx():
               try:
@@ -50,7 +52,7 @@ jobs:
                   meta = data["chart"]["result"][0]["meta"]
                   return float(meta["regularMarketPrice"]), float(meta["previousClose"])
               except Exception as e:
-                  print(f"SPX fetch error: {e}")
+                  print(f"[SPX ERROR] {e}")
                   return 0.0, 0.0
 
           def get_spx_5min_candle():
@@ -63,7 +65,7 @@ jobs:
                   closes = [c for c in closes if c is not None]
                   return float(closes[-2]) if len(closes) >= 2 else float(closes[-1])
               except Exception as e:
-                  print(f"5min candle error: {e}")
+                  print(f"[CANDLE ERROR] {e}")
                   return 0.0
 
           def get_stock(symbol):
@@ -77,53 +79,62 @@ jobs:
                   prev = float(meta.get("previousClose", price))
                   chg = ((price - prev) / prev * 100) if prev else 0
                   return f"${price:.2f} ({chg:+.1f}%)"
-              except Exception as e:
+              except:
                   return "N/A"
 
           def get_watchlist():
               symbols = ["NVDA", "SNDK", "LITE", "GEV", "MSTR", "USAR"]
-              parts = []
-              for s in symbols:
-                  parts.append(f"{s}: {get_stock(s)}")
+              parts = [f"{s}: {get_stock(s)}" for s in symbols]
               return " | ".join(parts)
 
           def now_est():
               return datetime.now(EST)
 
-          def wait_until(target_hour, target_min):
+          def sleep_until_est(target_hour, target_min):
               now = now_est()
               target = now.replace(hour=target_hour, minute=target_min, second=0, microsecond=0)
+              if target < now:
+                  target += timedelta(days=1)
               diff = (target - now).total_seconds()
               if diff > 0:
-                  print(f"Waiting {diff:.0f}s until {target_hour}:{target_min:02d} EST...")
+                  print(f"Sleeping {diff/60:.1f} min until {target_hour}:{target_min:02d} EST...")
                   time.sleep(diff)
 
-          # ── PHASE 1: PRE-MARKET 9:25 AM ──────────────────────────
+          # ── MARKET HOURS GUARD ───────────────────────────────────
+          est_now = now_est()
+          print(f"Script started at {est_now.strftime('%H:%M')} EST")
+
+          # If before 9:20 AM, sleep until 9:20 AM
+          if est_now.hour < 9 or (est_now.hour == 9 and est_now.minute < 20):
+              print("Before market hours - sleeping until 9:20 AM EST")
+              sleep_until_est(9, 20)
+
+          # If after 2 PM, exit - market monitoring window passed
+          est_now = now_est()
+          if est_now.hour >= 14:
+              print(f"After 2 PM EST ({est_now.strftime('%H:%M')}). Nothing to do. Exiting.")
+              exit(0)
+
+          # ── PHASE 1: PRE-MARKET 9:20-9:25 AM ────────────────────
           print("=== PHASE 1: PRE-MARKET ===")
           spx, prev = get_spx()
           spy = spx / 10
-          if spx > prev:
-              bias = "BULLISH"
-          elif spx < prev:
-              bias = "BEARISH"
-          else:
-              bias = "NEUTRAL"
-
+          bias = "BULLISH" if spx > prev else ("BEARISH" if spx < prev else "NEUTRAL")
           watchlist = get_watchlist()
+
           send_alert(
               "SPX Pre-Market Bias", "default", "chart_with_upwards_trend",
-              f"SPX: {spx:.2f} | SPY: ${spy:.2f} | Bias: {bias} | Prev Close: {prev:.2f}\n"
-              f"ORB levels announced at 9:45 AM | Before 11AM=0DTE After 11AM=1DTE\n"
-              f"{watchlist}"
+              f"SPX: {spx:.2f} | SPY: ${spy:.2f} | Bias: {bias} | Prev Close: {prev:.2f} | "
+              f"ORB levels at 9:45 AM | Before 11AM=0DTE After 11AM=1DTE | {watchlist}"
           )
 
-          # ── PHASE 2: ORB BUILDING 9:30–9:45 AM ──────────────────
-          print("=== PHASE 2: WAITING FOR MARKET OPEN ===")
-          wait_until(9, 30)
+          # ── PHASE 2: WAIT FOR MARKET OPEN 9:30 AM ───────────────
+          print("=== PHASE 2: WAITING FOR 9:30 AM ===")
+          sleep_until_est(9, 30)
 
           orb_high = 0.0
           orb_low = 999999.0
-          end_orb = time.time() + 900  # 15 minutes
+          end_orb = time.time() + 900
 
           send_alert("ORB Building", "default", "eyes",
               "Market open! Building 15-min ORB range. NO entries until 9:45 AM.")
@@ -131,66 +142,62 @@ jobs:
           while time.time() < end_orb:
               price, _ = get_spx()
               if price > 0:
-                  if price > orb_high:
-                      orb_high = price
-                  if price < orb_low:
-                      orb_low = price
-              print(f"SPX: {price:.2f} | ORB High: {orb_high:.2f} | ORB Low: {orb_low:.2f}")
+                  orb_high = max(orb_high, price)
+                  orb_low = min(orb_low, price)
+              print(f"SPX: {price:.2f} | High: {orb_high:.2f} | Low: {orb_low:.2f}")
               time.sleep(60)
 
-          # ── PHASE 3: ORB ANNOUNCEMENT 9:45 AM ────────────────────
+          # ── PHASE 3: ORB ANNOUNCEMENT 9:45 AM ───────────────────
           print("=== PHASE 3: ORB ANNOUNCEMENT ===")
           orb_range = orb_high - orb_low
           if orb_range < 15:
-              day_type = "CHOPPY"
-              t1_offset = 1.00
-              t2_offset = 1.50
+              day_type, t1_offset, t2_offset = "CHOPPY", 1.00, 1.50
           else:
-              day_type = "TRENDING"
-              t1_offset = 1.50
-              t2_offset = 2.00
+              day_type, t1_offset, t2_offset = "TRENDING", 1.50, 2.00
 
           send_alert(
               f"ORB SET - {day_type} DAY", "high", "chart_with_upwards_trend",
-              f"ORB High: {orb_high:.2f} | ORB Low: {orb_low:.2f} | Range: {orb_range:.2f} pts\n"
-              f"Day Type: {day_type}\n"
-              f"BULL entry: 5-min SPX candle CLOSES above {orb_high:.2f}\n"
-              f"BEAR entry: 5-min SPX candle CLOSES below {orb_low:.2f}\n"
-              f"T1: +${t1_offset:.2f} (sell 25 contracts) | T2: +${t2_offset:.2f} (sell 25 contracts)\n"
-              f"SPY options 0.10 delta 50 contracts total"
+              f"ORB High: {orb_high:.2f} | ORB Low: {orb_low:.2f} | Range: {orb_range:.2f} pts | {day_type} | "
+              f"BULL entry: 5-min candle CLOSES above {orb_high:.2f} | "
+              f"BEAR entry: 5-min candle CLOSES below {orb_low:.2f} | "
+              f"T1: +${t1_offset:.2f} sell 25 | T2: +${t2_offset:.2f} sell 25 | SPY 0.10 delta 50 contracts"
           )
 
-          # ── PHASE 4: MONITORING 9:45 AM – 2:00 PM ────────────────
+          # ── PHASE 4: MONITORING 9:45 AM - 2:00 PM ───────────────
           print("=== PHASE 4: MONITORING ===")
           in_trade = False
           direction = ""
           spy_entry = 0.0
-          t1 = 0.0
-          t2 = 0.0
-          t1_hit = False
-          t2_hit = False
+          t1 = t2 = 0.0
+          t1_hit = t2_hit = False
           last_hourly = time.time()
-          end_session = time.time() + 15300  # 4h 15min
+          approaching_sent = {"high": False, "low": False}
 
-          while time.time() < end_session:
+          # Run until 2:00 PM EST
+          while True:
+              est_now = now_est()
+              if est_now.hour >= 14:
+                  break
+
               price, _ = get_spx()
               spy_price = price / 10
               last_candle = get_spx_5min_candle()
-              est_now = now_est()
               expiry = "0DTE" if est_now.hour < 11 else "1DTE"
 
-              print(f"{est_now.strftime('%H:%M')} EST | SPX: {price:.2f} | SPY: ${spy_price:.2f} | Candle: {last_candle:.2f} | Trade: {in_trade} {direction}")
+              print(f"{est_now.strftime('%H:%M')} | SPX: {price:.2f} | SPY: ${spy_price:.2f} | Candle: {last_candle:.2f} | Trade: {in_trade} {direction}")
 
-              # Approaching alert
+              # Approaching alerts (only once per side)
               if not in_trade and price > 0:
                   dist_high = orb_high - price
                   dist_low = price - orb_low
-                  if 0 <= dist_high <= 2:
+                  if 0 <= dist_high <= 2 and not approaching_sent["high"]:
+                      approaching_sent["high"] = True
                       send_alert("APPROACHING ORB HIGH", "high", "eyes",
-                          f"SPX at {price:.2f} — only {dist_high:.1f} pts below ORB High {orb_high:.2f}! Get Robinhood ready for CALL!")
-                  if 0 <= dist_low <= 2:
+                          f"SPX at {price:.2f} - only {dist_high:.1f} pts from ORB High {orb_high:.2f}! Get Robinhood ready for CALL!")
+                  if 0 <= dist_low <= 2 and not approaching_sent["low"]:
+                      approaching_sent["low"] = True
                       send_alert("APPROACHING ORB LOW", "high", "eyes",
-                          f"SPX at {price:.2f} — only {dist_low:.1f} pts above ORB Low {orb_low:.2f}! Get Robinhood ready for PUT!")
+                          f"SPX at {price:.2f} - only {dist_low:.1f} pts from ORB Low {orb_low:.2f}! Get Robinhood ready for PUT!")
 
               # Bull entry
               if not in_trade and last_candle > orb_high and last_candle > 0:
@@ -199,47 +206,39 @@ jobs:
                   spy_entry = spy_price
                   t1 = round(spy_entry + t1_offset, 2)
                   t2 = round(spy_entry + t2_offset, 2)
+                  t1_hit = t2_hit = False
                   send_alert("BULL ENTRY - BUY SPY CALL NOW", "urgent", "rotating_light",
-                      f"BUY SPY CALL {expiry} 0.10 DELTA — 50 CONTRACTS NOW!\n"
-                      f"SPX 5-min candle closed at {last_candle:.2f} above ORB High {orb_high:.2f}\n"
-                      f"SPY entry: ${spy_entry:.2f}\n"
-                      f"T1: ${t1:.2f} — sell 25 contracts\n"
-                      f"T2: ${t2:.2f} — sell 25 contracts\n"
-                      f"Stop: 5-min candle closes back inside ORB\n"
-                      f"NO AUTO STOP ON ROBINHOOD — EXIT MANUALLY!")
+                      f"BUY SPY CALL {expiry} 0.10 DELTA 50 CONTRACTS NOW! "
+                      f"SPX candle closed {last_candle:.2f} above ORB High {orb_high:.2f} | "
+                      f"SPY entry: ${spy_entry:.2f} | T1: ${t1:.2f} sell 25 | T2: ${t2:.2f} sell 25 | "
+                      f"NO AUTO STOP ON ROBINHOOD - EXIT MANUALLY IF STOP HIT!")
 
               # Bear entry
-              elif not in_trade and last_candle < orb_low and last_candle > 0:
+              elif not in_trade and 0 < last_candle < orb_low:
                   in_trade = True
                   direction = "PUT"
                   spy_entry = spy_price
                   t1 = round(spy_entry - t1_offset, 2)
                   t2 = round(spy_entry - t2_offset, 2)
+                  t1_hit = t2_hit = False
                   send_alert("BEAR ENTRY - BUY SPY PUT NOW", "urgent", "rotating_light",
-                      f"BUY SPY PUT {expiry} 0.10 DELTA — 50 CONTRACTS NOW!\n"
-                      f"SPX 5-min candle closed at {last_candle:.2f} below ORB Low {orb_low:.2f}\n"
-                      f"SPY entry: ${spy_entry:.2f}\n"
-                      f"T1: ${t1:.2f} — sell 25 contracts\n"
-                      f"T2: ${t2:.2f} — sell 25 contracts\n"
-                      f"Stop: 5-min candle closes back inside ORB\n"
-                      f"NO AUTO STOP ON ROBINHOOD — EXIT MANUALLY!")
+                      f"BUY SPY PUT {expiry} 0.10 DELTA 50 CONTRACTS NOW! "
+                      f"SPX candle closed {last_candle:.2f} below ORB Low {orb_low:.2f} | "
+                      f"SPY entry: ${spy_entry:.2f} | T1: ${t1:.2f} sell 25 | T2: ${t2:.2f} sell 25 | "
+                      f"NO AUTO STOP ON ROBINHOOD - EXIT MANUALLY IF STOP HIT!")
 
               # Stop - Call
-              if in_trade and direction == "CALL" and last_candle < orb_high and last_candle > 0:
+              if in_trade and direction == "CALL" and 0 < last_candle < orb_high:
                   in_trade = False
-                  t1_hit = False
-                  t2_hit = False
                   send_alert("STOP HIT - EXIT CALL NOW", "urgent", "stop_sign",
-                      f"SPX 5-min candle closed back inside ORB at {last_candle:.2f}!\n"
+                      f"STOP! SPX candle closed back inside ORB at {last_candle:.2f}! "
                       f"SELL ALL 50 SPY CALLS NOW on Robinhood! SPX at {price:.2f}")
 
               # Stop - Put
               if in_trade and direction == "PUT" and last_candle > orb_low and last_candle > 0:
                   in_trade = False
-                  t1_hit = False
-                  t2_hit = False
                   send_alert("STOP HIT - EXIT PUT NOW", "urgent", "stop_sign",
-                      f"SPX 5-min candle closed back inside ORB at {last_candle:.2f}!\n"
+                      f"STOP! SPX candle closed back inside ORB at {last_candle:.2f}! "
                       f"SELL ALL 50 SPY PUTS NOW on Robinhood! SPX at {price:.2f}")
 
               # Target 1
@@ -247,8 +246,7 @@ jobs:
                   if (direction == "CALL" and spy_price >= t1) or (direction == "PUT" and spy_price <= t1):
                       t1_hit = True
                       send_alert("TARGET 1 HIT - SELL 25 NOW", "urgent", "trophy",
-                          f"T1 at ${t1:.2f} REACHED! SELL 25 CONTRACTS NOW on Robinhood!\n"
-                          f"Hold remaining 25 contracts for T2 at ${t2:.2f}")
+                          f"T1 at ${t1:.2f} REACHED! SELL 25 CONTRACTS NOW on Robinhood! Hold 25 for T2 at ${t2:.2f}")
 
               # Target 2
               if in_trade and t1_hit and not t2_hit:
@@ -256,26 +254,21 @@ jobs:
                       t2_hit = True
                       in_trade = False
                       send_alert("TARGET 2 HIT - EXIT ALL", "urgent", "trophy",
-                          f"T2 at ${t2:.2f} REACHED! SELL REMAINING 25 CONTRACTS NOW!\n"
-                          f"Trade complete! Great job!")
+                          f"T2 at ${t2:.2f} REACHED! SELL REMAINING 25 CONTRACTS NOW! Trade complete!")
 
               # Hourly update
               if time.time() - last_hourly >= 3600:
                   last_hourly = time.time()
                   watchlist = get_watchlist()
-                  if in_trade:
-                      status = f"IN {direction} | Entry: ${spy_entry:.2f} | T1: ${t1:.2f} | T2: ${t2:.2f}"
-                  else:
-                      status = f"Watching | ORB: {orb_low:.2f} - {orb_high:.2f}"
+                  status = f"IN {direction} Entry:${spy_entry:.2f} T1:${t1:.2f} T2:${t2:.2f}" if in_trade else f"Watching ORB:{orb_low:.2f}-{orb_high:.2f}"
                   send_alert("SPX Hourly Update", "default", "chart_with_upwards_trend",
-                      f"SPX: {price:.2f} | SPY: ${spy_price:.2f} | {status}\n{watchlist}")
+                      f"SPX:{price:.2f} SPY:${spy_price:.2f} | {status} | {watchlist}")
 
               time.sleep(60)
 
-          # ── SESSION CLOSE 2:00 PM ─────────────────────────────────
+          # ── SESSION CLOSE 2:00 PM ────────────────────────────────
           price, _ = get_spx()
           send_alert("Session Closed", "default", "white_check_mark",
-              f"ORB monitoring done for today. SPX final: {price:.2f}. See you tomorrow at 9:25 AM!")
-
+              f"ORB monitoring done. SPX final: {price:.2f}. See you tomorrow at 9:25 AM!")
           print("=== SESSION COMPLETE ===")
           PYEOF
